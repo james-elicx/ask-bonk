@@ -10,7 +10,6 @@ declare const Bun: {
   spawn(command: string[], options: {
     detached?: boolean;
     cwd?: string;
-    stdin?: "ignore" | "inherit" | Blob;
     env?: NodeJS.ProcessEnv;
     stdout: "pipe" | "ignore";
     stderr: "pipe" | "ignore";

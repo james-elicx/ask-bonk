@@ -8,9 +8,9 @@
 // Ported from OpenCode's packages/opencode/src/cli/cmd/github.handler.ts as
 // shipped in opencode-ai@dev in November 2026, for the USE_GITHUB_TOKEN mode
 // Bonk always uses: the same prompt context, response comments, reactions,
-// branches, commits, pushes and pull requests. The agent runs through
-// `opencode run`, which sends the prompt to the default agent as the same
-// single text message on a session that denies the question tool.
+// branches, commits, pushes and pull requests. Instead of running OpenCode
+// in-process, it starts `opencode serve` and sends the same session and
+// prompt requests to its API, so the agent sees exactly what it saw before.
 
 import { existsSync, readFileSync } from "fs";
 import { pathToFileURL } from "url";
@@ -21,7 +21,6 @@ import type {
   PullRequestReviewCommentEvent,
 } from "@octokit/webhooks-types";
 import { fetchWithRetry } from "./http";
-import { githubGraphQL } from "./review-state";
 
 // OpenCode removes only reactions left by its own App user. Bonk's token
 // reacts as Bonk, so the reaction stays, as it did under `opencode github run`.
@@ -29,7 +28,6 @@ const AGENT_USERNAME = "opencode-agent[bot]";
 const AGENT_REACTION = "eyes";
 const USER_EVENTS = ["issue_comment", "pull_request_review_comment", "issues", "pull_request"];
 const REPO_EVENTS = ["schedule", "workflow_dispatch"];
-const SUMMARY_AGENT = "bonk-response-summary";
 const SUMMARY_PROMPT =
   "Summarize the actions (tool calls & reasoning) you did for the user in 1-2 sentences.";
 
@@ -91,12 +89,88 @@ class GitError extends Error {
   }
 }
 
-// A failed `opencode run` whose cause is not an agent error; exits the run
-// with OpenCode's own exit code so run-opencode's retry rules still apply.
+// `opencode serve` exited on its own; the run exits with its code, as
+// `opencode github run` did when OpenCode itself failed.
 class OpenCodeExit extends Error {
   constructor(readonly exitCode: number) {
-    super(`opencode run exited with code ${exitCode}`);
+    super(`opencode serve exited with code ${exitCode}`);
   }
+}
+
+interface OpenCodeServer {
+  url: string;
+  authorization: string;
+  proc: BunSubprocess;
+  exitCode?: number;
+  stopping: boolean;
+  events: AbortController;
+}
+
+export function openCodeErrorMessage(status: number, body: string): string {
+  try {
+    const error = JSON.parse(body);
+    const message = error?.data?.message ?? error?.message;
+    if (message) return error.name ? `${error.name}: ${message}` : String(message);
+  } catch {}
+  return `OpenCode server returned ${status}: ${body}`;
+}
+
+// Starts the OpenCode server the turn talks to, as `opencode github run` ran
+// OpenCode in-process. It listens on a random loopback port with a password.
+async function startServer(env: NodeJS.ProcessEnv, cwd: string): Promise<OpenCodeServer> {
+  const password = crypto.randomUUID();
+  const username = env.OPENCODE_SERVER_USERNAME || "opencode";
+  let proc: BunSubprocess;
+  try {
+    proc = Bun.spawn(["opencode", "serve", "--hostname", "127.0.0.1", "--port", "0"], {
+      cwd,
+      env: { ...env, OPENCODE_SERVER_PASSWORD: password },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      console.error(error.message);
+      throw new OpenCodeExit(127);
+    }
+    throw error;
+  }
+  const server: OpenCodeServer = {
+    url: "",
+    authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`,
+    proc,
+    stopping: false,
+    events: new AbortController(),
+  };
+  const listening = new Promise<void>((resolve, reject) => {
+    void readLines(proc.stdout, (line) => {
+      const match = !server.url && line.match(/opencode server listening on (http:\/\/\S+)/);
+      if (match) {
+        server.url = match[1];
+        resolve();
+      } else {
+        console.log(line);
+      }
+    });
+    void pipeThrough(proc.stderr);
+    void proc.exited.then((code) => {
+      server.exitCode = code;
+      if (!server.stopping) console.error(`opencode serve exited with code ${code}`);
+      reject(new OpenCodeExit(code));
+    });
+  });
+  await listening;
+  return server;
+}
+
+async function stopServer(server: OpenCodeServer): Promise<void> {
+  server.stopping = true;
+  server.events.abort();
+  if (server.exitCode !== undefined) return;
+  server.proc.kill("SIGTERM");
+  const timer = setTimeout(() => server.proc.kill("SIGKILL"), 10_000);
+  await server.proc.exited.catch(() => {});
+  clearTimeout(timer);
 }
 
 const ISSUE_QUERY = `
@@ -323,68 +397,73 @@ export function commentPrompt(
   throw new Error(`Comments must mention ${mentions.map((m) => "`" + m + "`").join(" or ")}`);
 }
 
-// What `opencode run --format json` reported for one prompt.
-export interface RunOutcome {
-  sessionID?: string;
-  parts: number;
-  lastMessageID?: string;
-  lastText?: { messageID: string; text: string };
-  error?: { name: string; message: string };
+interface MessagePart {
+  type: string;
+  text?: string;
+  [key: string]: unknown;
 }
 
-export function applyRunEvent(outcome: RunOutcome, event: Payload): void {
-  if (typeof event.sessionID === "string") outcome.sessionID ??= event.sessionID;
-  if (event.type === "error") {
-    const error = event.error ?? {};
-    const data = error.data;
-    outcome.error ??= {
-      name: String(error.name ?? "UnknownError"),
-      message: data && typeof data === "object" && "message" in data ? String(data.message) : "",
-    };
-    return;
-  }
-  const part = event.part;
-  if (!part || typeof part.messageID !== "string") return;
-  outcome.parts += 1;
-  outcome.lastMessageID = part.messageID;
-  if (event.type === "text")
-    outcome.lastText = { messageID: part.messageID, text: part.text ?? "" };
+interface AgentError {
+  name: string;
+  data?: Record<string, unknown>;
+}
+
+// The final assistant message of a prompt, as OpenCode's session API returns it.
+export interface PromptResult {
+  info: { role: string; error?: AgentError };
+  parts: MessagePart[];
 }
 
 // OpenCode answers with the last text part of the final assistant message,
 // and asks for a summary when that message has none (it ended on tool calls).
-export function responseText(outcome: RunOutcome): string | null {
-  if (outcome.error) {
-    if (outcome.error.name === "ContextOverflowError") {
-      throw new Error("PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.");
-    }
-    throw new Error(`${outcome.error.name}: ${outcome.error.message}`);
-  }
-  if (outcome.lastText && outcome.lastText.messageID === outcome.lastMessageID) {
-    return outcome.lastText.text;
-  }
-  if (outcome.parts > 0) return null;
+export function responseText(parts: MessagePart[]): string | null {
+  const text = parts.findLast((part) => part.type === "text");
+  if (text) return text.text ?? "";
+  if (parts.length > 0) return null;
   throw new Error("Failed to parse response: no parts returned");
 }
 
-// The summary turn must not run tools, like OpenCode's `tools: { "*": false }`
-// prompt option, which `opencode run` does not expose. A primary agent that
-// denies every permission leaves the model no tools to call.
-export function summaryConfigContent(configContent: string | undefined): string {
-  const config = configContent?.trim() ? (JSON.parse(configContent) as Payload) : {};
-  const agents = config.agent && typeof config.agent === "object" ? config.agent : {};
-  return JSON.stringify({
-    ...config,
-    agent: {
-      ...agents,
-      [SUMMARY_AGENT]: {
-        mode: "primary",
-        description: "Summarizes a Bonk turn that ended without a text response.",
-        permission: { "*": "deny" },
-      },
-    },
-  });
+export function agentErrorMessage(error: AgentError): string {
+  if (error.name === "ContextOverflowError") {
+    return "PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.";
+  }
+  const message = error.data && "message" in error.data ? error.data.message : "";
+  return `${error.name}: ${message}`;
 }
+
+// Octokit's RequestError message for a failed GitHub API response.
+export function githubErrorMessage(data: unknown): string {
+  if (typeof data === "string") return data;
+  const body = (data ?? {}) as { message?: unknown; errors?: unknown; documentation_url?: unknown };
+  const suffix = "documentation_url" in body ? ` - ${body.documentation_url}` : "";
+  if ("message" in body) {
+    if (Array.isArray(body.errors)) {
+      return `${body.message}: ${body.errors.map((e) => JSON.stringify(e)).join(", ")}${suffix}`;
+    }
+    return `${body.message}${suffix}`;
+  }
+  return `Unknown error: ${JSON.stringify(data)}`;
+}
+
+// `core.setFailed` escapes the message so every line reaches the annotation.
+export function errorAnnotation(message: string): string {
+  return `::error::${message.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`;
+}
+
+// The flags OpenCode's Git service passes to every git command.
+const GIT_FLAGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.autocrlf=false",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.longpaths=true",
+  "-c",
+  "core.symlinks=true",
+  "-c",
+  "core.quotepath=false",
+];
 
 async function readLines(
   stream: ReadableStream<Uint8Array> | null,
@@ -427,10 +506,9 @@ const TOOL_LABELS: Record<string, string> = {
   websearch: "Search",
 };
 
-// Mirrors the tool and text lines `opencode github run` printed to the log.
-function logRunEvent(event: Payload): void {
-  const part = event.part;
-  if (event.type === "tool_use" && part?.state?.status === "completed") {
+// The tool and text lines `opencode github run` printed for its session.
+export function logPart(part: Payload): void {
+  if (part.type === "tool" && part.state?.status === "completed") {
     const tool = TOOL_LABELS[part.tool] ?? part.tool;
     const input = part.state.input ?? {};
     const title =
@@ -438,7 +516,7 @@ function logRunEvent(event: Payload): void {
     console.log();
     console.log(`| ${String(tool).padEnd(7, " ")} ${title}`);
   }
-  if (event.type === "text" && part?.text) {
+  if (part.type === "text" && part.time?.end) {
     console.log();
     console.log(part.text);
     console.log();
@@ -485,7 +563,8 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
   const variant = env.VARIANT || undefined;
   const cwd = process.cwd();
   let token = "";
-  let sessionID: string | undefined;
+  let server: OpenCodeServer | undefined;
+  let sessionID = "";
   let exitCode = 0;
 
   const footer = () => `\n\n[github run](${runUrl})`;
@@ -493,7 +572,7 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
   async function git(
     args: string[],
   ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(["git", ...GIT_FLAGS, ...args], { cwd, stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -525,74 +604,137 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
       },
       { retries: 0, timeoutMs: 60_000 },
     );
-    if (!response.ok) {
-      throw new Error(`${method} ${path} returned ${response.status}: ${await response.text()}`);
-    }
-    return response.status === 204 ? null : response.json();
+    if (response.status === 204) return null;
+    const text = await response.text();
+    const data = /application\/json/.test(response.headers.get("content-type") ?? "")
+      ? (() => {
+          try {
+            return JSON.parse(text);
+          } catch {
+            return text;
+          }
+        })()
+      : text;
+    if (!response.ok) throw new Error(githubErrorMessage(data));
+    return data;
   }
 
-  // Runs one prompt on the turn's session, creating it on the first call.
-  async function prompt(message: string, agent?: string): Promise<RunOutcome> {
-    const args = ["opencode", "run", "--format", "json"];
-    if (model) args.push("--model", model);
-    if (variant) args.push("--variant", variant);
-    if (sessionID) args.push("--session", sessionID);
-    if (agent) args.push("--agent", agent);
-    let proc: BunSubprocess;
-    try {
-      proc = Bun.spawn(args, {
-        cwd,
-        // Read from stdin, the prompt reaches the agent as one text part with
-        // no length limit, exactly as `opencode github run` sent it.
-        stdin: new Blob([message]),
-        env: agent
-          ? { ...env, OPENCODE_CONFIG_CONTENT: summaryConfigContent(env.OPENCODE_CONFIG_CONTENT) }
-          : env,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        console.error(error.message);
-        process.exit(127);
-      }
-      throw error;
+  async function graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    const result = await github("POST", "/graphql", { query, variables });
+    if (result?.errors) {
+      throw new Error(
+        "Request failed due to following response errors:\n" +
+          (result.errors as Array<{ message: string }>).map((e) => ` - ${e.message}`).join("\n"),
+      );
     }
-    const outcome: RunOutcome = { parts: 0 };
-    const onLine = (line: string) => {
-      if (!line.trim()) return;
+    return result.data as T;
+  }
+
+  // OpenCode's session API, served by `opencode serve` for this turn.
+  async function openCode(method: string, path: string, body?: unknown): Promise<any> {
+    if (!server) throw new Error("OpenCode server is not running");
+    const url = new URL(path, server.url);
+    url.searchParams.set("directory", cwd);
+    const response = await fetch(url, {
+      method,
+      headers: {
+        Authorization: server.authorization,
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      // A prompt holds the request open for the whole agent turn.
+      timeout: false,
+    } as RequestInit);
+    const text = await response.text();
+    if (!response.ok) throw new Error(openCodeErrorMessage(response.status, text));
+    return text.trim() ? JSON.parse(text) : null;
+  }
+
+  // Logs the session's tool calls and text like `opencode github run`, and
+  // rejects permission requests nobody can answer, like `opencode run`.
+  async function subscribe(): Promise<void> {
+    if (!server) return;
+    const url = new URL("/event", server.url);
+    url.searchParams.set("directory", cwd);
+    const response = await fetch(url, {
+      headers: { Authorization: server.authorization, Accept: "text/event-stream" },
+      signal: server.events.signal,
+      timeout: false,
+    } as RequestInit);
+    if (!response.ok) {
+      throw new Error(openCodeErrorMessage(response.status, await response.text()));
+    }
+    const sessions = new Set([sessionID]);
+    let connected!: () => void;
+    const ready = new Promise<void>((resolve) => (connected = resolve));
+    let data: string[] = [];
+    const dispatch = () => {
+      if (data.length === 0) return;
+      const raw = data.join("\n");
+      data = [];
       let event: Payload;
       try {
-        event = JSON.parse(line);
+        event = JSON.parse(raw);
       } catch {
-        console.log(line);
         return;
       }
-      // The whole error, as OpenCode logged it: run-opencode reads status codes
-      // and provider messages from the output to decide on a retry.
-      if (event.type === "error") console.error("Agent error:", event.error);
-      applyRunEvent(outcome, event);
-      logRunEvent(event);
+      connected();
+      const properties = event.properties ?? {};
+      if (event.type === "session.created" && sessions.has(properties.info?.parentID)) {
+        sessions.add(properties.info.id);
+      }
+      if (event.type === "message.part.updated" && properties.part?.sessionID === sessionID) {
+        logPart(properties.part);
+      }
+      if (event.type === "permission.asked" && sessions.has(properties.sessionID)) {
+        const patterns = Array.isArray(properties.patterns) ? properties.patterns : [];
+        console.log(
+          `! permission requested: ${properties.permission} (${patterns.join(", ")}); auto-rejecting`,
+        );
+        openCode("POST", `/permission/${properties.id}/reply`, { reply: "reject" }).catch((e) =>
+          console.error("Failed to reject permission request:", e),
+        );
+      }
     };
-    const [code] = await Promise.all([
-      proc.exited,
-      readLines(proc.stdout, onLine),
-      pipeThrough(proc.stderr),
-    ]);
-    sessionID ??= outcome.sessionID;
-    if (!outcome.error && code !== 0) throw new OpenCodeExit(code);
-    return outcome;
+    readLines(response.body, (line) => {
+      if (line === "" || line === "\r") dispatch();
+      else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+    })
+      .catch(() => {})
+      .finally(connected);
+    await ready;
+  }
+
+  async function prompt(text: string, tools?: Record<string, boolean>): Promise<PromptResult> {
+    const [providerID = "", ...rest] = (model ?? "").split("/");
+    return openCode("POST", `/session/${sessionID}/message`, {
+      model: { providerID, modelID: rest.join("/") },
+      variant,
+      ...(tools ? { tools } : {}),
+      parts: [{ type: "text", text }],
+    });
+  }
+
+  function throwIfAgentError(result: PromptResult, label: string) {
+    if (result.info.role === "assistant" && result.info.error) {
+      console.error(label, result.info.error);
+      throw new Error(agentErrorMessage(result.info.error));
+    }
   }
 
   async function chat(message: string): Promise<string> {
     console.log("Sending message to opencode...");
-    const text = responseText(await prompt(message));
+    const result = await prompt(message);
+    throwIfAgentError(result, "Agent error:");
+    const text = responseText(result.parts);
     if (text) return text;
 
     console.log("Requesting summary from agent...");
-    const summary = responseText(await prompt(SUMMARY_PROMPT, SUMMARY_AGENT));
-    if (!summary) throw new Error("Failed to get summary from agent");
-    return summary;
+    const summary = await prompt(SUMMARY_PROMPT, { "*": false });
+    throwIfAgentError(summary, "Summary agent error:");
+    const summaryText = responseText(summary.parts);
+    if (!summaryText) throw new Error("Failed to get summary from agent");
+    return summaryText;
   }
 
   async function summarize(response: string) {
@@ -810,15 +952,11 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
 
   async function fetchIssue(): Promise<GitHubIssue> {
     console.log("Fetching prompt data for issue...");
-    const result = await githubGraphQL<{ repository: { issue: GitHubIssue | null } }>(
-      token,
-      ISSUE_QUERY,
-      {
-        owner,
-        repo,
-        number: issueId,
-      },
-    );
+    const result = await graphql<{ repository: { issue: GitHubIssue | null } }>(ISSUE_QUERY, {
+      owner,
+      repo,
+      number: issueId,
+    });
     const issue = result.repository.issue;
     if (!issue) throw new Error(`Issue #${issueId} not found`);
     return issue;
@@ -826,8 +964,7 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
 
   async function fetchPR(): Promise<GitHubPullRequest> {
     console.log("Fetching prompt data for PR...");
-    const result = await githubGraphQL<{ repository: { pullRequest: GitHubPullRequest | null } }>(
-      token,
+    const result = await graphql<{ repository: { pullRequest: GitHubPullRequest | null } }>(
       PULL_REQUEST_QUERY,
       { owner, repo, number: issueId },
     );
@@ -848,6 +985,7 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
         "GITHUB_TOKEN environment variable is not set. When using use_github_token, you must provide GITHUB_TOKEN.",
       );
     }
+    server = await startServer(env, cwd);
 
     const customPrompt = env.PROMPT;
     let userPrompt: string;
@@ -864,6 +1002,12 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
     if (isUserEvent) await addReaction();
 
     const repoData = await github("GET", `/repos/${owner}/${repo}`);
+    const session = await openCode("POST", "/session", {
+      permission: [{ permission: "question", action: "deny", pattern: "*" }],
+    });
+    sessionID = session.id;
+    await subscribe();
+    console.log("opencode session", sessionID);
 
     if (isRepoEvent) {
       if (isWorkflowDispatchEvent && actor) console.log(`Triggered by: ${actor}`);
@@ -942,6 +1086,9 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
     }
   } catch (e) {
     if (e instanceof OpenCodeExit) return e.exitCode;
+    // OpenCode died mid-turn: exit with its code and no comment, as when
+    // `opencode github run` itself crashed.
+    if (server?.exitCode !== undefined && !server.stopping) return server.exitCode || 1;
     exitCode = 1;
     console.error(e instanceof Error ? e.message : String(e));
     const msg = e instanceof GitError ? e.stderr : e instanceof Error ? e.message : String(e);
@@ -953,7 +1100,9 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
         console.error("Failed to report error on GitHub:", error);
       }
     }
-    console.log(`::error::${msg}`);
+    console.log(errorAnnotation(msg));
+  } finally {
+    if (server) await stopServer(server);
   }
   return exitCode;
 }

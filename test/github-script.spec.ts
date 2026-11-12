@@ -39,13 +39,14 @@ import {
 } from "../github/script/review-state";
 import { readPublishState } from "../github/script/review-publish";
 import {
-  applyRunEvent,
+  agentErrorMessage,
   buildPromptDataForPR,
   commentPrompt,
+  errorAnnotation,
+  githubErrorMessage,
   responseText,
-  summaryConfigContent,
 } from "../github/script/github-run";
-import type { GitHubPullRequest, RunOutcome } from "../github/script/github-run";
+import type { GitHubPullRequest } from "../github/script/github-run";
 import { resolvePermissions } from "../src/oidc";
 
 async function withEnv<T>(values: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
@@ -1794,71 +1795,51 @@ describe("GitHub Action OpenCode dependency install", () => {
 });
 
 describe("GitHub Action turn runner", () => {
-  function outcomeOf(events: Array<Record<string, unknown>>): RunOutcome {
-    const outcome: RunOutcome = { parts: 0 };
-    for (const event of events) applyRunEvent(outcome, event);
-    return outcome;
-  }
-  const part = (type: string, messageID: string, extra: Record<string, unknown> = {}) => ({
-    type,
-    sessionID: "ses_1",
-    part: { type, messageID, sessionID: "ses_1", ...extra },
-  });
-
   it("answers with the last text of the final assistant message", () => {
-    const outcome = outcomeOf([
-      part("step_start", "msg_1"),
-      part("text", "msg_1", { text: "Looking at the diff" }),
-      part("tool_use", "msg_1", { tool: "read", state: { status: "completed", input: {} } }),
-      part("step_start", "msg_2"),
-      part("text", "msg_2", { text: "First draft" }),
-      part("text", "msg_2", { text: "LGTM" }),
-      part("step_finish", "msg_2"),
-    ]);
-    expect(outcome.sessionID).toBe("ses_1");
-    expect(responseText(outcome)).toBe("LGTM");
+    expect(
+      responseText([
+        { type: "step-start" },
+        { type: "text", text: "First draft" },
+        { type: "tool" },
+        { type: "text", text: "LGTM" },
+        { type: "step-finish" },
+      ]),
+    ).toBe("LGTM");
   });
 
   it("asks for a summary when the final message has no text", () => {
-    const outcome = outcomeOf([
-      part("text", "msg_1", { text: "Starting" }),
-      part("step_start", "msg_2"),
-      part("tool_use", "msg_2", { tool: "bash", state: { status: "completed", input: {} } }),
-      part("step_finish", "msg_2"),
-    ]);
-    expect(responseText(outcome)).toBeNull();
+    expect(responseText([{ type: "step-start" }, { type: "tool" }])).toBeNull();
+    expect(() => responseText([])).toThrow("Failed to parse response: no parts returned");
   });
 
   it("reports agent errors the way OpenCode did", () => {
-    const error = (name: string, message?: string) =>
-      outcomeOf([
-        part("step_start", "msg_1"),
-        { type: "error", sessionID: "ses_1", error: { name, data: message ? { message } : {} } },
-      ]);
-    expect(() => responseText(error("APIError", "rate limited"))).toThrow("APIError: rate limited");
-    expect(() => responseText(error("ContextOverflowError", "too long"))).toThrow(
-      "PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.",
+    expect(agentErrorMessage({ name: "APIError", data: { message: "rate limited" } })).toBe(
+      "APIError: rate limited",
     );
-    expect(() => responseText(outcomeOf([]))).toThrow(
-      "Failed to parse response: no parts returned",
+    expect(agentErrorMessage({ name: "UnknownError", data: {} })).toBe("UnknownError: ");
+    expect(agentErrorMessage({ name: "ContextOverflowError", data: { message: "long" } })).toBe(
+      "PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.",
     );
   });
 
-  it("adds a tool-less summary agent without dropping the run's config", () => {
-    const config = JSON.parse(
-      summaryConfigContent(
-        JSON.stringify({ instructions: ["guidance.md"], agent: { review: { mode: "subagent" } } }),
-      ),
-    );
-    expect(config.instructions).toEqual(["guidance.md"]);
-    expect(config.agent.review).toEqual({ mode: "subagent" });
-    expect(config.agent["bonk-response-summary"]).toMatchObject({
-      mode: "primary",
-      permission: { "*": "deny" },
-    });
+  it("reports GitHub API errors like Octokit", () => {
     expect(
-      JSON.parse(summaryConfigContent(undefined)).agent["bonk-response-summary"],
-    ).toBeDefined();
+      githubErrorMessage({
+        message: "Validation Failed",
+        errors: [{ resource: "PullRequest", message: "No commits between main and b" }],
+        documentation_url: "https://docs.github.com/x",
+      }),
+    ).toBe(
+      'Validation Failed: {"resource":"PullRequest","message":"No commits between main and b"} - https://docs.github.com/x',
+    );
+    expect(githubErrorMessage({ message: "Not Found" })).toBe("Not Found");
+    expect(githubErrorMessage("Bad Gateway")).toBe("Bad Gateway");
+  });
+
+  it("escapes error annotations like core.setFailed", () => {
+    expect(errorAnnotation("50% failed\r\nsecond line")).toBe(
+      "::error::50%25 failed%0D%0Asecond line",
+    );
   });
 
   it("falls back to OpenCode's comment prompts", () => {
