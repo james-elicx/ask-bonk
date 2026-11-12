@@ -38,6 +38,14 @@ import {
   summarizeReviewHistory,
 } from "../github/script/review-state";
 import { readPublishState } from "../github/script/review-publish";
+import {
+  applyRunEvent,
+  buildPromptDataForPR,
+  commentPrompt,
+  responseText,
+  summaryConfigContent,
+} from "../github/script/github-run";
+import type { GitHubPullRequest, RunOutcome } from "../github/script/github-run";
 import { resolvePermissions } from "../src/oidc";
 
 async function withEnv<T>(values: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
@@ -1782,5 +1790,138 @@ describe("GitHub Action OpenCode dependency install", () => {
 
     expect(result).toEqual([]);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^::warning::.*registry unreachable/));
+  });
+});
+
+describe("GitHub Action turn runner", () => {
+  function outcomeOf(events: Array<Record<string, unknown>>): RunOutcome {
+    const outcome: RunOutcome = { parts: 0 };
+    for (const event of events) applyRunEvent(outcome, event);
+    return outcome;
+  }
+  const part = (type: string, messageID: string, extra: Record<string, unknown> = {}) => ({
+    type,
+    sessionID: "ses_1",
+    part: { type, messageID, sessionID: "ses_1", ...extra },
+  });
+
+  it("answers with the last text of the final assistant message", () => {
+    const outcome = outcomeOf([
+      part("step_start", "msg_1"),
+      part("text", "msg_1", { text: "Looking at the diff" }),
+      part("tool_use", "msg_1", { tool: "read", state: { status: "completed", input: {} } }),
+      part("step_start", "msg_2"),
+      part("text", "msg_2", { text: "First draft" }),
+      part("text", "msg_2", { text: "LGTM" }),
+      part("step_finish", "msg_2"),
+    ]);
+    expect(outcome.sessionID).toBe("ses_1");
+    expect(responseText(outcome)).toBe("LGTM");
+  });
+
+  it("asks for a summary when the final message has no text", () => {
+    const outcome = outcomeOf([
+      part("text", "msg_1", { text: "Starting" }),
+      part("step_start", "msg_2"),
+      part("tool_use", "msg_2", { tool: "bash", state: { status: "completed", input: {} } }),
+      part("step_finish", "msg_2"),
+    ]);
+    expect(responseText(outcome)).toBeNull();
+  });
+
+  it("reports agent errors the way OpenCode did", () => {
+    const error = (name: string, message?: string) =>
+      outcomeOf([
+        part("step_start", "msg_1"),
+        { type: "error", sessionID: "ses_1", error: { name, data: message ? { message } : {} } },
+      ]);
+    expect(() => responseText(error("APIError", "rate limited"))).toThrow("APIError: rate limited");
+    expect(() => responseText(error("ContextOverflowError", "too long"))).toThrow(
+      "PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.",
+    );
+    expect(() => responseText(outcomeOf([]))).toThrow(
+      "Failed to parse response: no parts returned",
+    );
+  });
+
+  it("adds a tool-less summary agent without dropping the run's config", () => {
+    const config = JSON.parse(
+      summaryConfigContent(
+        JSON.stringify({ instructions: ["guidance.md"], agent: { review: { mode: "subagent" } } }),
+      ),
+    );
+    expect(config.instructions).toEqual(["guidance.md"]);
+    expect(config.agent.review).toEqual({ mode: "subagent" });
+    expect(config.agent["bonk-response-summary"]).toMatchObject({
+      mode: "primary",
+      permission: { "*": "deny" },
+    });
+    expect(
+      JSON.parse(summaryConfigContent(undefined)).agent["bonk-response-summary"],
+    ).toBeDefined();
+  });
+
+  it("falls back to OpenCode's comment prompts", () => {
+    const reviewComment = {
+      comment: { body: "/bonk", path: "src/a.ts", line: 4, diff_hunk: "@@ -1 +1 @@" },
+    };
+    expect(commentPrompt("issue_comment", { comment: { body: " /bonk " } }, "/bonk")).toBe(
+      "Summarize this thread",
+    );
+    expect(commentPrompt("pull_request_review_comment", reviewComment, "/bonk")).toBe(
+      "Review this code change and suggest improvements for the commented lines:\n\nFile: src/a.ts\nLines: 4\n\n@@ -1 +1 @@",
+    );
+    expect(commentPrompt("pull_request", {}, "/bonk")).toBe("Review this pull request");
+    expect(() => commentPrompt("issue_comment", { comment: { body: "hello" } }, "/bonk")).toThrow(
+      "Comments must mention `/bonk`",
+    );
+  });
+
+  it("builds OpenCode's pull request context without the trigger comment", () => {
+    const pr: GitHubPullRequest = {
+      number: 7,
+      url: "https://github.com/o/r/pull/7",
+      title: "Fix",
+      body: "Body",
+      author: { login: "dev" },
+      baseRefName: "main",
+      headRefName: "fix",
+      headRefOid: "abc",
+      createdAt: "2026-01-01T00:00:00Z",
+      additions: 3,
+      deletions: 1,
+      state: "OPEN",
+      baseRepository: { nameWithOwner: "o/r" },
+      headRepository: { nameWithOwner: "o/r" },
+      commits: { totalCount: 1 },
+      files: { nodes: [{ path: "a.ts", additions: 3, deletions: 1, changeType: "MODIFIED" }] },
+      comments: {
+        nodes: [
+          { databaseId: "1", body: "earlier", author: { login: "dev" }, createdAt: "t1" },
+          { databaseId: "2", body: "/bonk review", author: { login: "dev" }, createdAt: "t2" },
+        ],
+      },
+      reviews: {
+        nodes: [
+          {
+            author: { login: "rev" },
+            body: "Looks off",
+            submittedAt: "t3",
+            comments: { nodes: [{ body: "here", path: "a.ts", line: null }] },
+          },
+        ],
+      },
+    };
+    const prompt = buildPromptDataForPR(pr, 2);
+    expect(prompt).toContain("Number: 7\nURL: https://github.com/o/r/pull/7\nTitle: Fix");
+    expect(prompt).toContain(
+      "<pull_request_comments>\n- dev at t1: earlier\n</pull_request_comments>",
+    );
+    expect(prompt).not.toContain("/bonk review");
+    expect(prompt).toContain("- a.ts (MODIFIED) +3/-1");
+    // OpenCode joins each review's lines with commas; keep its exact prompt.
+    expect(prompt).toContain(
+      "<pull_request_reviews>\n- rev at t3:,  - Review body: Looks off,  - Comments:,    - a.ts:?: here\n</pull_request_reviews>",
+    );
   });
 });
