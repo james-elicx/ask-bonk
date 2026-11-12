@@ -416,6 +416,7 @@ async function pipeThrough(stream: ReadableStream<Uint8Array> | null): Promise<v
 }
 
 const TOOL_LABELS: Record<string, string> = {
+  todowrite: "Todo",
   bash: "Shell",
   edit: "Edit",
   glob: "Glob",
@@ -567,6 +568,9 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
         console.log(line);
         return;
       }
+      // The whole error, as OpenCode logged it: run-opencode reads status codes
+      // and provider messages from the output to decide on a retry.
+      if (event.type === "error") console.error("Agent error:", event.error);
       applyRunEvent(outcome, event);
       logRunEvent(event);
     };
@@ -576,11 +580,7 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
       pipeThrough(proc.stderr),
     ]);
     sessionID ??= outcome.sessionID;
-    if (outcome.error) {
-      console.error("Agent error:", outcome.error);
-    } else if (code !== 0) {
-      throw new OpenCodeExit(code);
-    }
+    if (!outcome.error && code !== 0) throw new OpenCodeExit(code);
     return outcome;
   }
 
