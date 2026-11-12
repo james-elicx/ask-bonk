@@ -654,8 +654,9 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
   // rejects permission requests nobody can answer, like `opencode run`.
   async function subscribe(): Promise<void> {
     if (!server) return;
-    const url = new URL("/event", server.url);
-    url.searchParams.set("directory", cwd);
+    // `/event` closes straight after `server.connected` on some releases, so
+    // follow every instance through `/global/event` and filter by session.
+    const url = new URL("/global/event", server.url);
     const response = await fetch(url, {
       headers: { Authorization: server.authorization, Accept: "text/event-stream" },
       signal: server.events.signal,
@@ -679,6 +680,7 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
         return;
       }
       connected();
+      event = event.payload ?? event;
       const properties = event.properties ?? {};
       if (event.type === "session.created" && sessions.has(properties.info?.parentID)) {
         sessions.add(properties.info.id);
