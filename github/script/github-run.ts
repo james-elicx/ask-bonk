@@ -85,7 +85,9 @@ class GitError extends Error {
     readonly exitCode: number,
     readonly stderr: string,
   ) {
-    super(`git ${args.join(" ")} failed with exit code ${exitCode}: ${stderr}`);
+    const output = stderr.trim();
+    const command = `Command failed with code ${exitCode}: git ${args.join(" ")}`;
+    super(output ? `${command}\n${output}` : command);
   }
 }
 
@@ -161,6 +163,18 @@ async function startServer(env: NodeJS.ProcessEnv, cwd: string): Promise<OpenCod
   });
   await listening;
   return server;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// A request to the server failed. If the server is exiting, that is the real
+// failure: wait briefly for its exit code, then exit with it.
+async function throwIfServerExited(server: OpenCodeServer): Promise<void> {
+  if (server.stopping) return;
+  const code =
+    server.exitCode ??
+    (await Promise.race([server.proc.exited, sleep(2000).then(() => undefined)]));
+  if (code !== undefined) throw new OpenCodeExit(code || 1);
 }
 
 async function stopServer(server: OpenCodeServer): Promise<void> {
@@ -494,32 +508,65 @@ async function pipeThrough(stream: ReadableStream<Uint8Array> | null): Promise<v
   }
 }
 
-const TOOL_LABELS: Record<string, string> = {
-  todowrite: "Todo",
-  bash: "Shell",
-  edit: "Edit",
-  glob: "Glob",
-  grep: "Grep",
-  list: "List",
-  read: "Read",
-  write: "Write",
-  websearch: "Search",
+const STYLE = {
+  danger: "\x1b[91m\x1b[1m",
+  dim: "\x1b[90m",
+  dimBold: "\x1b[90m\x1b[1m",
+  highlight: "\x1b[96m\x1b[1m",
+  info: "\x1b[94m\x1b[1m",
+  normal: "\x1b[0m",
+  success: "\x1b[92m\x1b[1m",
+  warning: "\x1b[93m\x1b[1m",
 };
+
+const TOOL_LABELS: Record<string, [string, string]> = {
+  todowrite: ["Todo", STYLE.warning],
+  bash: ["Shell", STYLE.danger],
+  edit: ["Edit", STYLE.success],
+  glob: ["Glob", STYLE.info],
+  grep: ["Grep", STYLE.info],
+  list: ["List", STYLE.info],
+  read: ["Read", STYLE.highlight],
+  write: ["Write", STYLE.success],
+  websearch: ["Search", STYLE.dimBold],
+};
+
+// OpenCode's CLI output helpers: lines go to stderr, and a blank line is
+// skipped when the previous one was blank too.
+let lastLineBlank = false;
+function printLine(...parts: string[]) {
+  lastLineBlank = false;
+  process.stderr.write(parts.join(" ") + "\n");
+}
+function printBlank() {
+  if (lastLineBlank) return;
+  printLine(STYLE.normal);
+  lastLineBlank = true;
+}
+
+const printsLine = (part: Payload) =>
+  (part.type === "tool" && part.state?.status === "completed") ||
+  (part.type === "text" && Boolean(part.time?.end));
 
 // The tool and text lines `opencode github run` printed for its session.
 export function logPart(part: Payload): void {
   if (part.type === "tool" && part.state?.status === "completed") {
-    const tool = TOOL_LABELS[part.tool] ?? part.tool;
+    const [tool, color] = TOOL_LABELS[part.tool] ?? [part.tool, STYLE.info];
     const input = part.state.input ?? {};
     const title =
       part.state.title || Object.keys(input).length > 0 ? JSON.stringify(input) : "Unknown";
     console.log();
-    console.log(`| ${String(tool).padEnd(7, " ")} ${title}`);
+    printLine(
+      color + "|",
+      STYLE.normal + STYLE.dim + ` ${String(tool).padEnd(7, " ")}`,
+      "",
+      STYLE.normal + title,
+    );
   }
   if (part.type === "text" && part.time?.end) {
-    console.log();
-    console.log(part.text);
-    console.log();
+    printBlank();
+    printLine(part.text);
+    printBlank();
   }
 }
 
@@ -566,6 +613,8 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
   let server: OpenCodeServer | undefined;
   let sessionID = "";
   let exitCode = 0;
+  const sessionErrors: AgentError[] = [];
+  const loggedParts = new Set<string>();
 
   const footer = () => `\n\n[github run](${runUrl})`;
 
@@ -635,19 +684,32 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
     if (!server) throw new Error("OpenCode server is not running");
     const url = new URL(path, server.url);
     url.searchParams.set("directory", cwd);
-    const response = await fetch(url, {
-      method,
-      headers: {
-        Authorization: server.authorization,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      // A prompt holds the request open for the whole agent turn.
-      timeout: false,
-    } as RequestInit);
-    const text = await response.text();
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          Authorization: server.authorization,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        // A prompt holds the request open for the whole agent turn.
+        timeout: false,
+      } as RequestInit);
+      text = await response.text();
+    } catch (error) {
+      await throwIfServerExited(server);
+      throw error;
+    }
     if (!response.ok) throw new Error(openCodeErrorMessage(response.status, text));
     return text.trim() ? JSON.parse(text) : null;
+  }
+
+  function printPart(part: Payload) {
+    if (!printsLine(part) || loggedParts.has(part.id)) return;
+    loggedParts.add(part.id);
+    logPart(part);
   }
 
   // Logs the session's tool calls and text like `opencode github run`, and
@@ -686,7 +748,10 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
         sessions.add(properties.info.id);
       }
       if (event.type === "message.part.updated" && properties.part?.sessionID === sessionID) {
-        logPart(properties.part);
+        printPart(properties.part);
+      }
+      if (event.type === "session.error" && properties.sessionID === sessionID) {
+        if (properties.error) sessionErrors.push(properties.error);
       }
       if (event.type === "permission.asked" && sessions.has(properties.sessionID)) {
         const patterns = Array.isArray(properties.patterns) ? properties.patterns : [];
@@ -709,12 +774,35 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
 
   async function prompt(text: string, tools?: Record<string, boolean>): Promise<PromptResult> {
     const [providerID = "", ...rest] = (model ?? "").split("/");
-    return openCode("POST", `/session/${sessionID}/message`, {
-      model: { providerID, modelID: rest.join("/") },
-      variant,
-      ...(tools ? { tools } : {}),
-      parts: [{ type: "text", text }],
-    });
+    const errorsBefore = sessionErrors.length;
+    let result: PromptResult;
+    try {
+      result = await openCode("POST", `/session/${sessionID}/message`, {
+        model: { providerID, modelID: rest.join("/") },
+        variant,
+        ...(tools ? { tools } : {}),
+        parts: [{ type: "text", text }],
+      });
+    } catch (error) {
+      if (error instanceof OpenCodeExit) throw error;
+      // The HTTP error hides the cause (an empty 400, or a stack trace); the
+      // session.error event carries the message OpenCode threw in-process.
+      const errorsAtFailure = sessionErrors.length;
+      for (let i = 0; i < 50 && sessionErrors.length === errorsAtFailure; i++) await sleep(20);
+      const sessionError = sessionErrors.length > errorsBefore ? sessionErrors.at(-1) : undefined;
+      if (sessionError) {
+        const message = sessionError.data?.message;
+        throw new Error(message ? String(message) : agentErrorMessage(sessionError));
+      }
+      throw error;
+    }
+    // Part events can trail the response; print the reply's parts first so
+    // the log reads in order, as when OpenCode ran in-process.
+    const pending = () =>
+      (result.parts as Payload[]).filter((part) => printsLine(part) && !loggedParts.has(part.id));
+    for (let i = 0; i < 50 && pending().length > 0; i++) await sleep(20);
+    for (const part of pending()) printPart(part);
+    return result;
   }
 
   function throwIfAgentError(result: PromptResult, label: string) {
@@ -1087,10 +1175,9 @@ export async function runGitHubTurn(env: NodeJS.ProcessEnv = process.env): Promi
       }
     }
   } catch (e) {
-    if (e instanceof OpenCodeExit) return e.exitCode;
     // OpenCode died mid-turn: exit with its code and no comment, as when
     // `opencode github run` itself crashed.
-    if (server?.exitCode !== undefined && !server.stopping) return server.exitCode || 1;
+    if (e instanceof OpenCodeExit) return e.exitCode;
     exitCode = 1;
     console.error(e instanceof Error ? e.message : String(e));
     const msg = e instanceof GitError ? e.stderr : e instanceof Error ? e.message : String(e);
